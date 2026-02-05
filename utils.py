@@ -16,6 +16,7 @@ from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     ConfusionMatrixDisplay,
+    roc_auc_score,
 )
 from tsfresh import extract_features
 from tsfresh.feature_extraction import (
@@ -898,6 +899,12 @@ def RF_meta_label_model(
     feat_cols: list,
     shap_sample_size: int = 100,
     alpha: float = 0.5,
+    reducing_n_estimators: int = 1000,
+    base_n_estimators: int = 200,
+    meta_n_estimators: int = 100,
+    early_stop: Optional[dict] = None,
+    target_precision: Optional[float] = None,
+    min_precision_coverage: float = 0.05,
 ):
     debug_block(
         "RF_meta_label_model:start",
@@ -911,7 +918,7 @@ def RF_meta_label_model(
     if len(train_bin) == 0:
         raise ValueError("No labeled samples (-1/1) in base_reg_df for training.")
 
-    reducing_feat_model = RandomForestClassifier(n_estimators=1000, random_state=42)
+    reducing_feat_model = RandomForestClassifier(n_estimators=reducing_n_estimators, random_state=42)
     reducing_feat_model.fit(train_bin[feat_cols], train_bin["Event"])
 
     sample_n = min(shap_sample_size, len(train_bin))
@@ -924,16 +931,87 @@ def RF_meta_label_model(
     shap_ranking = pd.Series(mean_abs_shap, index=train_bin[feat_cols].columns).sort_values(ascending=False)
     top_k_features = shap_ranking.head(top_k_shap).index.tolist()
 
-    base_model = RandomForestClassifier(n_estimators=200, random_state=4)
-    base_model.fit(train_bin[top_k_features], train_bin["Event"])
+    base_model = RandomForestClassifier(
+        n_estimators=0 if early_stop else base_n_estimators,
+        random_state=4,
+        warm_start=bool(early_stop),
+    )
+
+    def _fit_with_early_stop(X, y):
+        cfg = early_stop or {}
+        val_frac = float(cfg.get("val_frac", 0.2))
+        patience = int(cfg.get("patience", 3))
+        min_delta = float(cfg.get("min_delta", 1e-4))
+        step = int(cfg.get("step", 50))
+        max_estimators = int(cfg.get("max_estimators", base_n_estimators))
+
+        if len(X) < 200 or val_frac <= 0 or val_frac >= 0.5:
+            base_model.set_params(n_estimators=max_estimators)
+            base_model.fit(X, y)
+            return
+
+        split_idx = int(len(X) * (1 - val_frac))
+        X_tr, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_tr, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        if len(X_val) < 50 or len(np.unique(y_val)) < 2:
+            base_model.set_params(n_estimators=max_estimators)
+            base_model.fit(X, y)
+            return
+
+        best_auc = -np.inf
+        bad = 0
+        n_estimators = 0
+
+        while n_estimators < max_estimators:
+            n_estimators = min(n_estimators + step, max_estimators)
+            base_model.set_params(n_estimators=n_estimators)
+            base_model.fit(X_tr, y_tr)
+            proba = base_model.predict_proba(X_val)[:, 1]
+            auc = roc_auc_score((y_val == 1).astype(int), proba)
+            if auc > best_auc + min_delta:
+                best_auc = auc
+                bad = 0
+            else:
+                bad += 1
+                if bad >= patience:
+                    break
+
+    if early_stop:
+        _fit_with_early_stop(train_bin[top_k_features], train_bin["Event"])
+    else:
+        base_model.fit(train_bin[top_k_features], train_bin["Event"])
 
     base_preds_meta = base_model.predict(meta_reg_df[top_k_features])
     base_probs_meta = base_model.predict_proba(meta_reg_df[top_k_features]).max(axis=1)
 
     probs_base = base_model.predict_proba(base_reg_df[top_k_features])
     max_probs_base = probs_base.max(axis=1)
-    conformal_score = 1 - max_probs_base
-    threshold = np.quantile(conformal_score, 1 - alpha)
+
+    def _threshold_for_precision(probs, y_true, precision_target, min_keep_frac):
+        order = np.argsort(probs)[::-1]
+        y = y_true[order]
+        p = probs[order]
+        correct = (y == 1).astype(int)
+        cum_correct = np.cumsum(correct)
+        cum_total = np.arange(1, len(p) + 1)
+        precision = cum_correct / cum_total
+        min_keep = max(1, int(len(p) * min_keep_frac))
+        idx = np.where((precision >= precision_target) & (cum_total >= min_keep))[0]
+        if len(idx) == 0:
+            return None
+        return p[idx[-1]]
+
+    threshold = None
+    if target_precision is not None:
+        y_base = (base_reg_df["Event"].values == base_model.predict(base_reg_df[top_k_features])).astype(int)
+        threshold = _threshold_for_precision(
+            max_probs_base, y_base, float(target_precision), float(min_precision_coverage)
+        )
+
+    if threshold is None:
+        conformal_score = 1 - max_probs_base
+        threshold = np.quantile(conformal_score, 1 - alpha)
 
     adjusted_preds = np.where(base_probs_meta >= 1 - threshold, base_preds_meta, 0)
 
@@ -941,7 +1019,7 @@ def RF_meta_label_model(
     meta_remain["signals"] = adjusted_preds
     meta_remain["meta_feature"] = np.where(meta_remain["signals"] == meta_remain["Event"], 1, 0)
 
-    meta_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    meta_model = RandomForestClassifier(n_estimators=meta_n_estimators, random_state=42)
     meta_model.fit(meta_remain[top_k_features], meta_remain["meta_feature"])
 
     debug_block(
@@ -966,6 +1044,12 @@ def run_hmm_rf_pipeline_from_split(
     alpha: float = 0.5,
     skew_col: str = "ret_skew_20",
     skew_threshold: float = 0.5,
+    reducing_n_estimators: int = 1000,
+    base_n_estimators: int = 200,
+    meta_n_estimators: int = 100,
+    early_stop: Optional[dict] = None,
+    target_precision: Optional[float] = None,
+    min_precision_coverage: float = 0.05,
 ):
     debug_block(
         "run_hmm_rf_pipeline_from_split:start",
@@ -1065,6 +1149,12 @@ def run_hmm_rf_pipeline_from_split(
         feat_cols=feat_cols,
         shap_sample_size=shap_sample_size,
         alpha=alpha,
+        reducing_n_estimators=reducing_n_estimators,
+        base_n_estimators=base_n_estimators,
+        meta_n_estimators=meta_n_estimators,
+        early_stop=early_stop,
+        target_precision=target_precision,
+        min_precision_coverage=min_precision_coverage,
     )
 
     use_cols = [c for c in top_k_features if c in test_df.columns]
@@ -1129,6 +1219,12 @@ def run_rf_pipeline_from_split(
     top_k_shap: int = 20,
     shap_sample_size: int = 200,
     alpha: float = 0.5,
+    reducing_n_estimators: int = 1000,
+    base_n_estimators: int = 200,
+    meta_n_estimators: int = 100,
+    early_stop: Optional[dict] = None,
+    target_precision: Optional[float] = None,
+    min_precision_coverage: float = 0.05,
 ):
     debug_block(
         "run_rf_pipeline_from_split:start",
@@ -1155,6 +1251,12 @@ def run_rf_pipeline_from_split(
         feat_cols=feat_cols,
         shap_sample_size=shap_sample_size,
         alpha=alpha,
+        reducing_n_estimators=reducing_n_estimators,
+        base_n_estimators=base_n_estimators,
+        meta_n_estimators=meta_n_estimators,
+        early_stop=early_stop,
+        target_precision=target_precision,
+        min_precision_coverage=min_precision_coverage,
     )
 
     test_df["meta_label_probs"] = meta_m.predict_proba(test_df[top_feats])[:, 1]

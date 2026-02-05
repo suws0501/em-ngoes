@@ -45,6 +45,7 @@ CONFIG = {
         "shap_sample_size": 200,
         "alpha": 0.5,
         "n_components": 3,
+        "hmm_iter": 600,
     },
     "hmm_avg": {
         "embargo_period": 30,
@@ -52,6 +53,24 @@ CONFIG = {
         "shap_sample_size": 200,
         "alpha": 0.5,
         "n_components": 2,
+        "hmm_iter": 600,
+    },
+    "training_iters": {
+        "reducing_n_estimators": 2000,
+        "base_n_estimators": 400,
+        "meta_n_estimators": 200,
+    },
+    "early_stop": {
+        "enabled": True,
+        "val_frac": 0.2,
+        "patience": 3,
+        "min_delta": 1e-4,
+        "step": 50,
+    },
+    "precision_gate": {
+        "enabled": True,
+        "target_precision": 0.6,
+        "min_coverage": 0.05,
     },
     "run_examples": {
         "rf_trailing": True,
@@ -163,6 +182,16 @@ def run_rf_trailing_example(together: pd.DataFrame, higher_frequency_data: pd.Da
         shap_sample_size=config["rf"]["shap_sample_size"],
         alpha=config["rf"]["alpha"],
         top_k_shap=config["rf"]["top_k_shap"],
+        reducing_n_estimators=config["training_iters"]["reducing_n_estimators"],
+        base_n_estimators=config["training_iters"]["base_n_estimators"],
+        meta_n_estimators=config["training_iters"]["meta_n_estimators"],
+        early_stop=config["early_stop"] if config["early_stop"]["enabled"] else None,
+        target_precision=(
+            config["precision_gate"]["target_precision"]
+            if config["precision_gate"]["enabled"]
+            else None
+        ),
+        min_precision_coverage=config["precision_gate"]["min_coverage"],
     )
 
     explainer = shap.TreeExplainer(reducing_feature_model)
@@ -208,6 +237,16 @@ def run_rf_avg_example(together: pd.DataFrame, config: dict):
         shap_sample_size=config["rf_avg"]["shap_sample_size"],
         alpha=config["rf_avg"]["alpha"],
         top_k_shap=config["rf_avg"]["top_k_shap"],
+        reducing_n_estimators=config["training_iters"]["reducing_n_estimators"],
+        base_n_estimators=config["training_iters"]["base_n_estimators"],
+        meta_n_estimators=config["training_iters"]["meta_n_estimators"],
+        early_stop=config["early_stop"] if config["early_stop"]["enabled"] else None,
+        target_precision=(
+            config["precision_gate"]["target_precision"]
+            if config["precision_gate"]["enabled"]
+            else None
+        ),
+        min_precision_coverage=config["precision_gate"]["min_coverage"],
     )
 
     test_equity_curve, trade_log = strategy_backtesting_average_change_rate(
@@ -247,6 +286,17 @@ def run_hmm_trailing_example(together: pd.DataFrame, higher_frequency_data: pd.D
         shap_sample_size=config["hmm"]["shap_sample_size"],
         alpha=config["hmm"]["alpha"],
         n_components=config["hmm"]["n_components"],
+        hmm_iter=config["hmm"]["hmm_iter"],
+        reducing_n_estimators=config["training_iters"]["reducing_n_estimators"],
+        base_n_estimators=config["training_iters"]["base_n_estimators"],
+        meta_n_estimators=config["training_iters"]["meta_n_estimators"],
+        early_stop=config["early_stop"] if config["early_stop"]["enabled"] else None,
+        target_precision=(
+            config["precision_gate"]["target_precision"]
+            if config["precision_gate"]["enabled"]
+            else None
+        ),
+        min_precision_coverage=config["precision_gate"]["min_coverage"],
     )
 
     testset = art["testset"]
@@ -290,6 +340,17 @@ def run_hmm_avg_example(together: pd.DataFrame, config: dict):
         shap_sample_size=config["hmm_avg"]["shap_sample_size"],
         alpha=config["hmm_avg"]["alpha"],
         n_components=config["hmm_avg"]["n_components"],
+        hmm_iter=config["hmm_avg"]["hmm_iter"],
+        reducing_n_estimators=config["training_iters"]["reducing_n_estimators"],
+        base_n_estimators=config["training_iters"]["base_n_estimators"],
+        meta_n_estimators=config["training_iters"]["meta_n_estimators"],
+        early_stop=config["early_stop"] if config["early_stop"]["enabled"] else None,
+        target_precision=(
+            config["precision_gate"]["target_precision"]
+            if config["precision_gate"]["enabled"]
+            else None
+        ),
+        min_precision_coverage=config["precision_gate"]["min_coverage"],
     )
 
     testset = art["testset"]
